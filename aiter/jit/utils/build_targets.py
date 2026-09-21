@@ -5,6 +5,13 @@
 # No torch dependency — safe to import in build scripts, gen_instances, and tests
 # that run without a GPU or a full PyTorch install.
 import os
+import sys
+
+# core.py imports this file as `build_targets` via sys.path; mha.py and tests
+# import `aiter.jit.utils.build_targets`. One module object keeps
+# UnmappedCkFmhaTargetsError identity consistent for except / pytest.raises.
+sys.modules.setdefault("build_targets", sys.modules[__name__])
+sys.modules.setdefault("aiter.jit.utils.build_targets", sys.modules[__name__])
 
 GFX_MAP = {
     0: "native",
@@ -103,3 +110,96 @@ def filter_tune_df(tune_df, targets: list):
     for gfx, cu_num in targets:
         mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
     return tune_df[mask]
+
+
+# CK 01_fmha/generate.py --targets factory keys. Longest prefix first so
+# gfx950 is not gfx9, gfx115 is not gfx11, gfx1250 is not gfx12.
+_CK_FMHA_ARCH_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("gfx950", "gfx950"),
+    ("gfx125", "gfx125"),
+    ("gfx120", "gfx12"),
+    ("gfx115", "gfx115"),
+    ("gfx11", "gfx11"),
+    ("gfx9", "gfx9"),
+)
+
+
+class UnmappedCkFmhaTargetsError(RuntimeError):
+    """No GPU_ARCHS entry maps to a CK fmha factory key.
+
+    ck_fmha_targets() raises this instead of falling back to CK's default
+    gfx9,gfx950. get_args_of_build("all") catches it per module so an
+    unmapped arch (cpu, gfx1030, ...) does not abort unrelated prebuilds
+    (this guard covers the get_args_of_build("all") traversal used by
+    PREBUILD_KERNELS 2/3; the PREBUILD_KERNELS==1 path in setup.py calls
+    the mha-specific builders directly and still raises on an unmapped arch).
+    """
+
+
+def map_gpu_archs_to_ck_fmha_targets(archs: list[str]) -> list[str]:
+    """Map GPU_ARCHS / get_gfx_list() names to CK fmha factory keys.
+
+    Unknown names are omitted. Already-emitted keys are skipped. Order follows
+    the input arch list.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    for arch in archs:
+        name = arch.split(":", 1)[0].lower()
+        mapped = None
+        for prefix, key in _CK_FMHA_ARCH_PREFIXES:
+            if name.startswith(prefix):
+                mapped = key
+                break
+        if mapped is None or mapped in seen:
+            continue
+        seen.add(mapped)
+        keys.append(mapped)
+    return keys
+
+
+def ck_fmha_targets() -> str:
+    """Comma-joined CK fmha --targets for the current get_gfx_list().
+
+    Raises UnmappedCkFmhaTargetsError (a RuntimeError subclass) if nothing
+    maps — never fall back to CK's default gfx9,gfx950.
+    """
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    archs = get_gfx_list()
+    keys = map_gpu_archs_to_ck_fmha_targets(archs)
+    if not keys:
+        raise UnmappedCkFmhaTargetsError(
+            f"No CK fmha --targets mapping for GPU_ARCHS={archs!r}; "
+            "refusing to fall back to CK default gfx9,gfx950"
+        )
+    return ",".join(keys)
+
+
+def ck_fmha_batch_prefill_targets() -> str:
+    """gfx9* subset of ck_fmha_targets() keys. Empty string if none (do not raise)."""
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    keys = [
+        k
+        for k in map_gpu_archs_to_ck_fmha_targets(get_gfx_list())
+        if k.startswith("gfx9")
+    ]
+    return ",".join(keys)
+
+
+def ck_fmha_batch_prefill_gen_targets() -> str:
+    """--targets for 01_fmha generate.py -d batch_prefill.
+
+    CK drops *all* batch_prefill kernels if any --targets token is not gfx9*
+    (has_non_gfx9 in example/ck_tile/01_fmha/codegen/ops/fmha_batch_prefill.py).
+    Pass the gfx9* subset when the mapped list has one; otherwise pass
+    ck_fmha_targets() (e.g. gfx11) so generate.py still emits
+    fmha_batch_prefill_api.cpp.
+
+    module_mha_batch_prefill and libmha_fwd both compile
+    cpp_itfs/mha_fwd_batch_prefill.cu, which calls fmha_batch_prefill().
+    Skipping generate.py (empty blob_gen_cmd) only skips staging sources —
+    PREBUILD=2 still builds the module and then link-fails. Do not return ''.
+    """
+    return ck_fmha_batch_prefill_targets() or ck_fmha_targets()
