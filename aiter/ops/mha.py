@@ -14,6 +14,11 @@ from ..jit.core import (
     compile_ops,
     is_experimental_enabled,
 )
+from ..jit.utils.build_targets import (
+    ck_fmha_batch_prefill_gen_targets,
+    ck_fmha_targets,
+    map_gpu_archs_to_ck_fmha_targets,
+)
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -34,6 +39,28 @@ def _fmha_kv_byte_extent_ge_u32(
     k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
     v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
     return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
+
+
+def _ck_fmha_runtime_key() -> str:
+    keys = map_gpu_archs_to_ck_fmha_targets([get_gfx()])
+    return keys[0] if keys else ""
+
+
+def _raise_if_gfx11_fp8_fa(dtype) -> None:
+    key = _ck_fmha_runtime_key()
+    if key in ("gfx11", "gfx115") and dtype == dtypes.fp8:
+        raise NotImplementedError(
+            f"CK fmha_fwd has no fp8 factory on {get_gfx()} (CK target {key})"
+        )
+
+
+def _raise_if_rdna_batch_prefill() -> None:
+    key = _ck_fmha_runtime_key()
+    if not key.startswith("gfx9"):
+        raise NotImplementedError(
+            f"mha_batch_prefill is gfx9-only; not supported on {get_gfx()} "
+            f"(CK target {key or 'unmapped'})"
+        )
 
 
 def cmdGenFunc_mha_fwd(
@@ -59,6 +86,7 @@ def cmdGenFunc_mha_fwd(
     sink_ptr: Tensor | None = None,
     gen: Generator | None = None,
 ):
+    _raise_if_gfx11_fp8_fa(q.dtype)
     _, seqlen_q, _, _ = q.shape
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -116,7 +144,9 @@ def cmdGenFunc_mha_fwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 100 --filter {} --targets {} --output_dir {{}}".format(
+            filter, ck_fmha_targets()
+        ),
     ]
     return {
         "md_name": md_name,
@@ -854,6 +884,7 @@ def cmdGenFunc_mha_varlen_fwd(
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: torch.Tensor | None = None,
 ):
+    _raise_if_gfx11_fp8_fa(q.dtype)
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
@@ -941,11 +972,15 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+            "--receipt 200 --filter {} --targets {} --output_dir {{}}".format(
+                '" "', ck_fmha_targets()
+            )
         ]
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+            "--receipt 200 --filter {} --targets {} --output_dir {{}}".format(
+                filter_fwd_splitkv, ck_fmha_targets()
+            )
         )
     return {
         "md_name": md_name,
@@ -1233,7 +1268,9 @@ def cmdGenFunc_mha_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 300 --filter {} --targets {} --output_dir {{}}".format(
+            filter, ck_fmha_targets()
+        ),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
@@ -1491,7 +1528,9 @@ def cmdGenFunc_mha_varlen_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 400 --filter {} --targets {} --output_dir {{}}".format(
+            filter, ck_fmha_targets()
+        ),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
@@ -1536,6 +1575,7 @@ def cmdGenFunc_mha_batch_prefill(
     sink_ptr: Tensor | None = None,
     gen: Generator | None = None,
 ):
+    _raise_if_rdna_batch_prefill()
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if max_seqlen_q == 1 and alibi_slopes is None:
@@ -1610,9 +1650,12 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_nsink"
         filter_fwd += "_nsink*"
+    bp_targets = ck_fmha_batch_prefill_gen_targets()
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
-        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        "--receipt 200 --filter {} --targets {} --output_dir {{}}".format(
+            filter_fwd, bp_targets
+        )
     ]
     return {
         "md_name": md_name,
@@ -4094,6 +4137,7 @@ def mha_batch_prefill_func(
     sink_ptr=None,
     sink_size: int = 0,
 ):
+    _raise_if_rdna_batch_prefill()
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if sink_ptr is not None:

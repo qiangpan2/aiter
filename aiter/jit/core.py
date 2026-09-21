@@ -22,6 +22,12 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+# json blob_gen_cmd eval() needs these names in module globals.
+from build_targets import (  # noqa: F401
+    UnmappedCkFmhaTargetsError,
+    ck_fmha_batch_prefill_gen_targets,
+    ck_fmha_targets,
+)
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -1491,7 +1497,11 @@ def get_args_of_build(ops_name: str, exclude=None):
                     # exclude
                     if op_name in exclude:
                         continue
-                    single_ops = convert(d_ops)
+                    try:
+                        single_ops = convert(d_ops)
+                    except UnmappedCkFmhaTargetsError as e:
+                        logger.warning("Skipping %s: %s", op_name, e)
+                        continue
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
                     if not is_experimental_enabled() and single_ops.get(
                         "is_experimental", False

@@ -3,6 +3,7 @@
 
 import argparse
 import math
+import sys
 
 import pandas as pd
 import pytest
@@ -17,6 +18,23 @@ from aiter.ops.mha import (
 )
 from aiter.test_common import run_perftest
 from aiter.test_mha_common import attention_ref
+
+
+def _ck_fmha_runtime_key() -> str:
+    try:
+        from aiter.jit.utils.build_targets import map_gpu_archs_to_ck_fmha_targets
+        from aiter.jit.utils.chip_info import get_gfx
+
+        keys = map_gpu_archs_to_ck_fmha_targets([get_gfx()])
+        return keys[0] if keys else ""
+    except (ImportError, RuntimeError):
+        return ""
+
+
+_SKIP_FP8_ON_GFX11 = pytest.mark.skipif(
+    _ck_fmha_runtime_key() in ("gfx11", "gfx115"),
+    reason="CK fmha_fwd has no fp8 factory on gfx11/gfx115",
+)
 
 benchmark = {}
 
@@ -86,6 +104,7 @@ def run_ck(
 
 
 # @pytest.mark.parametrize("local", [False, True])
+@_SKIP_FP8_ON_GFX11
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 8])
@@ -313,6 +332,12 @@ parser.add_argument(
 
 if __name__ == "__main__":
     args = parser.parse_args()
+
+    if _ck_fmha_runtime_key() in ("gfx11", "gfx115"):
+        aiter.logger.warning(
+            "CK fmha_fwd has no fp8 factory on %s; skipping", _ck_fmha_runtime_key()
+        )
+        sys.exit(0)
 
     nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
     seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
